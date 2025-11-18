@@ -1,0 +1,37 @@
+# ========================================
+# Minimal API Testing Requirements
+# Based on working langchain-kr environment versions
+# ========================================
+
+# Core LangGraph and LangChain
+langgraph>=0.3.18
+langchain-core>=1.0.5
+
+# API integrations
+langchain-openai>=0.3.35
+langchain-google-genai>=2.1.0
+langchain-anthropic>=0.3.10
+langchain-upstage>=0.7.4
+langchain-perplexity>=1.0.0
+langchain-teddynote>=0.3.44
+
+# Environment and utilities
+python-dotenv>=1.0.1
+
+# Web API & UI
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+streamlit>=1.38.0
+requests>=2.32.3
+
+# Known Windows wheel requirement
+PyYAML==6.0.1
+
+# Additional dependencies
+tokenizers>=0.20.0
+pypdf>=4.2.0
+
+# Jupyter support
+jupyter>=1.1.1
+notebook>=7.3.3
+ipykernel

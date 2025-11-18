@@ -191,6 +191,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Runtime artifacts
+.fastapi_url
+
 # PyPI configuration file
 .pypirc
 
