@@ -1,6 +1,7 @@
 # API LangGraph Test
 
-FastAPI와 Streamlit 기반의 멀티 LLM 비교 테스트 애플리케이션
+FastAPI와 Streamlit 기반의 멀티 LLM 비교 테스트 애플리케이션  
+> **최종 업데이트: 2025-11-20** — LangGraph 스트리밍 응답 및 문서 구조 정비
 
 ## 📋 프로젝트 개요
 
@@ -44,7 +45,7 @@ UPSTAGE_API_KEY=your-upstage-key
 PPLX_API_KEY=your-perplexity-key
 LANGSMITH_API_KEY=your-langsmith-key
 LANGSMITH_TRACING=true
-LANGSMITH_PROJECT=API-LangGraph-Test
+LANGSMITH_PROJECT=yout-project-name
 ```
 
 ### 3. 실행
@@ -55,7 +56,12 @@ LANGSMITH_PROJECT=API-LangGraph-Test
 
 # 또는
 python main.py
+
+# Streamlit + FastAPI 실행 스크립트를 직접 호출할 수도 있습니다.
+python scripts/run_app.py
 ```
+
+`scripts/run_app.py`는 `.fastapi_url` 파일과 `FASTAPI_URL` 환경변수를 갱신해 Streamlit이 FastAPI 백엔드와 통신할 수 있도록 합니다. 기본 포트는 `FASTAPI_PORT=8000`, `STREAMLIT_SERVER_PORT=8501`이며 충돌 시 환경변수를 수정한 뒤 다시 실행하세요.
 
 서버가 시작되면:
 - **FastAPI**: http://127.0.0.1:8001
@@ -65,15 +71,25 @@ python main.py
 
 ```
 api-test/
-├── main.py                 # 메인 실행 파일 (FastAPI + Streamlit 통합)
-├── server.py               # FastAPI 서버 정의
-├── streamlit_app.py        # Streamlit UI
-├── langgraph_service.py    # LangGraph 워크플로우 및 LLM 호출 로직
-├── notebooks/              # Jupyter 노트북 (개발/테스트용)
+├── app/
+│   ├── __init__.py
+│   ├── config.py                  # Pydantic Settings (환경변수 관리)
+│   ├── main.py                    # FastAPI 앱 팩토리
+│   ├── api/
+│   │   └── routes.py              # FastAPI 엔드포인트 정의
+│   ├── services/
+│   │   └── langgraph.py           # LangGraph 워크플로우 및 LLM 호출
+│   └── ui/
+│       └── streamlit_app.py       # Streamlit UI
+├── scripts/
+│   └── run_app.py                 # FastAPI + Streamlit 동시 실행 스크립트
+├── main.py                        # scripts/run_app.py 래퍼 (개발 편의)
+├── notebooks/
 │   └── api_langgraph_test.ipynb
-├── docs/                   # 문서
-│   └── changelog/          # 날짜별 변경 이력
-└── .env                    # 환경변수 (API 키 등)
+├── docs/
+│   ├── changelog/
+│   └── development/
+└── .env
 ```
 
 ## 🔧 주요 기능
@@ -118,24 +134,18 @@ Content-Type: application/json
 }
 ```
 
-**응답 예시:**
-```json
-{
-  "question": "AI란 무엇인가?",
-  "answers": {
-    "OpenAI": "AI는...",
-    "Gemini": "AI는...",
-    "Anthropic": "AI는...",
-    "Perplexity": "AI는...",
-    "Upstage": "AI는..."
-  },
-  "api_status": {
-    "OpenAI": {"status": 200, "detail": "stop"},
-    "Gemini": {"status": 200, "detail": "STOP"},
-    ...
-  },
-  "messages": [...]
-}
+**응답 형식**
+
+- 스트리밍 방식(Newline Delimited JSON)
+  - `type: "partial"` 이벤트가 모델별 완료 순서대로 도착합니다.
+  - 마지막에는 `type: "summary"` 이벤트가 전체 결과(`question`, `answers`, `api_status`, `messages`)를 포함해 전달됩니다.
+
+예시 스트림:
+```
+{"type":"partial","model":"OpenAI","answer":"...","status":{"status":200,"detail":"stop"}}
+{"type":"partial","model":"Gemini","answer":"...","status":{"status":200,"detail":"stop"}}
+...
+{"type":"summary","result":{"question":"AI란 무엇인가?","answers":{...},"api_status":{...},"messages":[...]}}
 ```
 
 ## 📝 변경 이력
