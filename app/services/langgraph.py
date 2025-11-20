@@ -13,6 +13,20 @@ from langchain_openai import ChatOpenAI
 from langchain_teddynote import logging
 from langchain_teddynote.models import ChatPerplexity
 from langchain_upstage import ChatUpstage
+try:
+    from langchain_mistralai.chat_models import ChatMistralAI
+except ImportError:  # pragma: no cover
+    ChatMistralAI = None  # type: ignore[assignment]
+
+try:
+    from langchain_groq import ChatGroq
+except ImportError:  # pragma: no cover
+    ChatGroq = None  # type: ignore[assignment]
+
+try:
+    from langchain_cohere import ChatCohere
+except ImportError:  # pragma: no cover
+    ChatCohere = None  # type: ignore[assignment]
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Send
@@ -32,6 +46,7 @@ load_dotenv()
 logging.langsmith("API-LangGraph-Test")
 
 logger = get_logger(__name__)
+DEFAULT_MAX_TURNS = 3
 
 
 def _preview(text: str, limit: int = 80) -> str:
@@ -41,25 +56,81 @@ def _preview(text: str, limit: int = 80) -> str:
     return compact[:limit] + ("…" if len(compact) > limit else "")
 
 
+async def _summarize_content(llm: Any, content: str, label: str) -> str:
+    """모델 응답을 짧게 요약한다."""
+
+    summary_prompt = (
+        "다음 답변을 핵심만 2문장 이하로 매우 간결하게 요약하세요.\n\n"
+        f"답변:\n{content}\n"
+    )
+    try:
+        response = await _ainvoke(llm, summary_prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        return str(text)
+    except Exception as exc:
+        logger.warning("%s 요약 실패: %s", label, exc)
+        return content[:200]
+
+
+def merge_dicts(existing: dict | None, new: dict | None) -> dict:
+    """LangGraph 상태 병합 시 딕셔너리를 병합한다."""
+
+    merged: dict = dict(existing or {})
+    merged.update(new or {})
+    return merged
+
+
 class GraphState(TypedDict, total=False):
     """LangGraph 실행 시 공유되는 상태 정의."""
 
     question: Annotated[str, "Question"]
+    max_turns: Annotated[int | None, "최대 턴 수"]
+    conversation_history: Annotated[list[dict[str, str]] | None, "전체 대화 히스토리"]
+    history_summary: Annotated[str | None, "요약된 대화"]
+    turn: Annotated[int | None, "현재 턴 인덱스"]
+    current_inputs: Annotated[dict[str, str] | None, merge_dicts]
+    active_models: Annotated[list[str] | None, "활성화된 모델 목록"]
 
     openai_answer: Annotated[str | None, "OpenAI 응답"]
     gemini_answer: Annotated[str | None, "Google Gemini 응답"]
     anthropic_answer: Annotated[str | None, "Anthropic Claude 응답"]
     upstage_answer: Annotated[str | None, "Upstage 응답"]
     perplexity_answer: Annotated[str | None, "Perplexity 응답"]
-    tavily_search: Annotated[str | None, "Tavily 검색 결과"]
+    mistral_answer: Annotated[str | None, "Mistral AI 응답"]
+    groq_answer: Annotated[str | None, "Groq 응답"]
+    cohere_answer: Annotated[str | None, "Cohere 응답"]
+
+    raw_responses: Annotated[dict[str, str] | None, merge_dicts]
+    self_summaries: Annotated[dict[str, str] | None, merge_dicts]
+    openai_summary: Annotated[str | None, "OpenAI 자기 요약"]
+    gemini_summary: Annotated[str | None, "Gemini 자기 요약"]
+    anthropic_summary: Annotated[str | None, "Anthropic 자기 요약"]
+    upstage_summary: Annotated[str | None, "Upstage 자기 요약"]
+    perplexity_summary: Annotated[str | None, "Perplexity 자기 요약"]
+    mistral_summary: Annotated[str | None, "Mistral 자기 요약"]
+    groq_summary: Annotated[str | None, "Groq 자기 요약"]
+    cohere_summary: Annotated[str | None, "Cohere 자기 요약"]
 
     openai_status: Annotated[dict[str, Any] | None, "OpenAI 호출 상태"]
     gemini_status: Annotated[dict[str, Any] | None, "Gemini 호출 상태"]
     anthropic_status: Annotated[dict[str, Any] | None, "Anthropic 호출 상태"]
     upstage_status: Annotated[dict[str, Any] | None, "Upstage 호출 상태"]
     perplexity_status: Annotated[dict[str, Any] | None, "Perplexity 호출 상태"]
+    mistral_status: Annotated[dict[str, Any] | None, "Mistral 호출 상태"]
+    groq_status: Annotated[dict[str, Any] | None, "Groq 호출 상태"]
+    cohere_status: Annotated[dict[str, Any] | None, "Cohere 호출 상태"]
+    summary_model: Annotated[str | None, "요약에 사용한 모델"]
 
     messages: Annotated[list, add_messages]
+
+
+def _default_active_models() -> list[str]:
+    return list(NODE_CONFIG.keys())
+
+
+def _model_label(node_name: str) -> str:
+    meta = NODE_CONFIG.get(node_name)
+    return meta["label"] if meta else node_name
 
 
 def build_status_from_response(
@@ -112,25 +183,34 @@ def format_response_message(label: str, payload: Any) -> tuple[str, str]:
 
 
 def init_question(state: GraphState) -> GraphState:
-    """그래프 초기 상태를 검증하고 기본 메시지를 설정한다.
+    """그래프 초기 상태를 검증하고 기본 메시지를 설정한다."""
 
-    Args:
-        state: LangGraph가 전달한 질문 상태.
-
-    Returns:
-        GraphState: 질문과 초기 메시지를 포함한 상태.
-
-    Raises:
-        ValueError: 질문이 비어 있는 경우.
-    """
     question = state.get("question")
     if not question:
         raise ValueError("질문이 비어 있습니다.")
 
+    max_turns = state.get("max_turns") or DEFAULT_MAX_TURNS
+    active_models = state.get("active_models") or list(NODE_CONFIG.keys())
+    current_inputs = state.get("current_inputs") or {
+        NODE_CONFIG[node]["label"]: question for node in active_models
+    }
+    history = state.get("conversation_history")
+    if not history:
+        history = [{"role": "user", "content": question}]
+    turn_value = state.get("turn") or 1
+
     logger.debug("질문 초기화: %s", _preview(question))
     return GraphState(
         question=question,
-        messages=[("user", question)],
+        max_turns=max_turns,
+        turn=turn_value,
+        conversation_history=history,
+        history_summary=state.get("history_summary"),
+        current_inputs=current_inputs,
+        active_models=active_models,
+        raw_responses=state.get("raw_responses") or {},
+        self_summaries=state.get("self_summaries") or {},
+        messages=state.get("messages") or [("user", question)],
     )
 
 
@@ -152,17 +232,23 @@ async def call_openai(state: GraphState) -> GraphState:
     Returns:
         GraphState: OpenAI 응답/상태/메시지를 담은 상태 델타.
     """
+    inputs = state.get("current_inputs") or {}
     question = state["question"]
+    prompt = inputs.get("OpenAI") or question
     llm = ChatOpenAI(model="gpt-5-nano")
     logger.debug("OpenAI 호출 시작")
     try:
-        response = await _ainvoke(llm, question)
+        response = await _ainvoke(llm, prompt)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "OpenAI")
         logger.info("OpenAI 응답 완료: %s", status.get("detail"))
         return GraphState(
             openai_answer=content,
             openai_status=status,
+            openai_summary=summary,
+            raw_responses={"OpenAI": content},
+            self_summaries={"OpenAI": summary},
             messages=[format_response_message("OpenAI", response)],
         )
     except Exception as exc:
@@ -183,17 +269,23 @@ async def call_gemini(state: GraphState) -> GraphState:
     Returns:
         GraphState: Gemini 응답/상태/메시지를 담은 상태 델타.
     """
+    inputs = state.get("current_inputs") or {}
     question = state["question"]
+    prompt = inputs.get("Gemini") or question
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
     logger.debug("Gemini 호출 시작")
     try:
-        response = await _ainvoke(llm, question)
+        response = await _ainvoke(llm, prompt)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Gemini")
         logger.info("Gemini 응답 완료: %s", status.get("detail"))
         return GraphState(
             gemini_answer=content,
             gemini_status=status,
+            gemini_summary=summary,
+            raw_responses={"Gemini": content},
+            self_summaries={"Gemini": summary},
             messages=[format_response_message("Gemini", response)],
         )
     except Exception as exc:
@@ -214,17 +306,23 @@ async def call_anthropic(state: GraphState) -> GraphState:
     Returns:
         GraphState: Claude 응답/상태/메시지를 담은 상태 델타.
     """
+    inputs = state.get("current_inputs") or {}
     question = state["question"]
+    prompt = inputs.get("Anthropic") or question
     llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
     logger.debug("Anthropic 호출 시작")
     try:
-        response = await _ainvoke(llm, question)
+        response = await _ainvoke(llm, prompt)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Anthropic")
         logger.info("Anthropic 응답 완료: %s", status.get("detail"))
         return GraphState(
             anthropic_answer=content,
             anthropic_status=status,
+            anthropic_summary=summary,
+            raw_responses={"Anthropic": content},
+            self_summaries={"Anthropic": summary},
             messages=[format_response_message("Anthropic", response)],
         )
     except Exception as exc:
@@ -245,17 +343,23 @@ async def call_upstage(state: GraphState) -> GraphState:
     Returns:
         GraphState: Upstage 응답/상태/메시지를 담은 상태 델타.
     """
+    inputs = state.get("current_inputs") or {}
     question = state["question"]
+    prompt = inputs.get("Upstage") or question
     llm = ChatUpstage(model="solar-mini")
     logger.debug("Upstage 호출 시작")
     try:
-        response = await _ainvoke(llm, question)
+        response = await _ainvoke(llm, prompt)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Upstage")
         logger.info("Upstage 응답 완료: %s", status.get("detail"))
         return GraphState(
             upstage_answer=content,
             upstage_status=status,
+            upstage_summary=summary,
+            raw_responses={"Upstage": content},
+            self_summaries={"Upstage": summary},
             messages=[format_response_message("Upstage", response)],
         )
     except Exception as exc:
@@ -276,7 +380,9 @@ async def call_perplexity(state: GraphState) -> GraphState:
     Returns:
         GraphState: Perplexity 응답/상태/메시지를 담은 상태 델타.
     """
+    inputs = state.get("current_inputs") or {}
     question = state["question"]
+    prompt = inputs.get("Perplexity") or question
     llm = ChatPerplexity(
         model="sonar",
         temperature=0.2,
@@ -289,13 +395,17 @@ async def call_perplexity(state: GraphState) -> GraphState:
     )
     logger.debug("Perplexity 호출 시작")
     try:
-        response = await _ainvoke(llm, question)
+        response = await _ainvoke(llm, prompt)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Perplexity")
         logger.info("Perplexity 응답 완료: %s", status.get("detail"))
         return GraphState(
             perplexity_answer=content,
             perplexity_status=status,
+            perplexity_summary=summary,
+            raw_responses={"Perplexity": content},
+            self_summaries={"Perplexity": summary},
             messages=[format_response_message("Perplexity", response)],
         )
     except Exception as exc:
@@ -307,12 +417,129 @@ async def call_perplexity(state: GraphState) -> GraphState:
         )
 
 
+async def call_mistral(state: GraphState) -> GraphState:
+    """Mistral AI 모델을 호출한다."""
+
+    inputs = state.get("current_inputs") or {}
+    question = state["question"]
+    prompt = inputs.get("Mistral") or question
+    if ChatMistralAI is None:
+        error = RuntimeError("langchain-mistralai 패키지가 설치되어 있지 않습니다.")
+        logger.warning("Mistral AI 사용 불가: %s", error)
+        status = build_status_from_error(error)
+        return GraphState(
+            mistral_status=status,
+            messages=[format_response_message("Mistral 오류", error)],
+        )
+    llm = ChatMistralAI(model="mistral-large-latest", temperature=0)
+    try:
+        response = await _ainvoke(llm, prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Mistral")
+        logger.info("Mistral 응답 완료: %s", status.get("detail"))
+        return GraphState(
+            mistral_answer=content,
+            mistral_status=status,
+            mistral_summary=summary,
+            raw_responses={"Mistral": content},
+            self_summaries={"Mistral": summary},
+            messages=[format_response_message("Mistral", response)],
+        )
+    except Exception as exc:
+        status = build_status_from_error(exc)
+        logger.warning("Mistral 호출 실패: %s", exc)
+        return GraphState(
+            mistral_status=status,
+            messages=[format_response_message("Mistral 오류", exc)],
+        )
+
+
+async def call_groq(state: GraphState) -> GraphState:
+    """Groq 기반 모델을 호출한다."""
+
+    inputs = state.get("current_inputs") or {}
+    question = state["question"]
+    prompt = inputs.get("Groq") or question
+    if ChatGroq is None:
+        error = RuntimeError("langchain-groq 패키지가 설치되어 있지 않습니다.")
+        logger.warning("Groq 사용 불가: %s", error)
+        status = build_status_from_error(error)
+        return GraphState(
+            groq_status=status,
+            messages=[format_response_message("Groq 오류", error)],
+        )
+    try:
+        llm = ChatGroq(model="llama3-70b-8192", temperature=0)
+        response = await _ainvoke(llm, prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Groq")
+        logger.info("Groq 응답 완료: %s", status.get("detail"))
+        return GraphState(
+            groq_answer=content,
+            groq_status=status,
+            groq_summary=summary,
+            raw_responses={"Groq": content},
+            self_summaries={"Groq": summary},
+            messages=[format_response_message("Groq", response)],
+        )
+    except Exception as exc:
+        status = build_status_from_error(exc)
+        logger.warning("Groq 호출 실패: %s", exc)
+        return GraphState(
+            groq_status=status,
+            messages=[format_response_message("Groq 오류", exc)],
+        )
+
+
+async def call_cohere(state: GraphState) -> GraphState:
+    """Cohere Command 모델을 호출한다."""
+
+    inputs = state.get("current_inputs") or {}
+    question = state["question"]
+    prompt = inputs.get("Cohere") or question
+    if ChatCohere is None:
+        error = RuntimeError("langchain-cohere 패키지가 설치되어 있지 않습니다.")
+        logger.warning("Cohere 사용 불가: %s", error)
+        status = build_status_from_error(error)
+        return GraphState(
+            cohere_status=status,
+            messages=[format_response_message("Cohere 오류", error)],
+        )
+    llm = ChatCohere(model="command-r-plus", temperature=0)
+    try:
+        response = await _ainvoke(llm, prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        status = build_status_from_response(response)
+        summary = await _summarize_content(llm, content, "Cohere")
+        logger.info("Cohere 응답 완료: %s", status.get("detail"))
+        return GraphState(
+            cohere_answer=content,
+            cohere_status=status,
+            cohere_summary=summary,
+            raw_responses={"Cohere": content},
+            self_summaries={"Cohere": summary},
+            messages=[format_response_message("Cohere", response)],
+        )
+    except Exception as exc:
+        status = build_status_from_error(exc)
+        logger.warning("Cohere 호출 실패: %s", exc)
+        return GraphState(
+            cohere_status=status,
+            messages=[format_response_message("Cohere 오류", exc)],
+        )
+
+
 NODE_CONFIG: dict[str, dict[str, str]] = {
     "call_openai": {"label": "OpenAI", "answer_key": "openai_answer", "status_key": "openai_status"},
     "call_gemini": {"label": "Gemini", "answer_key": "gemini_answer", "status_key": "gemini_status"},
     "call_anthropic": {"label": "Anthropic", "answer_key": "anthropic_answer", "status_key": "anthropic_status"},
     "call_perplexity": {"label": "Perplexity", "answer_key": "perplexity_answer", "status_key": "perplexity_status"},
     "call_upstage": {"label": "Upstage", "answer_key": "upstage_answer", "status_key": "upstage_status"},
+    "call_mistral": {"label": "Mistral", "answer_key": "mistral_answer", "status_key": "mistral_status"},
+    "call_groq": {"label": "Groq", "answer_key": "groq_answer", "status_key": "groq_status"},
+    "call_cohere": {"label": "Cohere", "answer_key": "cohere_answer", "status_key": "cohere_status"},
 }
 
 
@@ -322,9 +549,9 @@ def dispatch_llm_calls(state: GraphState) -> list[Send]:
     question = state.get("question")
     if not question:
         raise ValueError("질문이 비어 있습니다.")
-    # 동일한 상태를 각 노드에 전달해 LangGraph가 병렬 실행하도록 지시
-    logger.info("LLM fan-out 실행: %s", ", ".join(NODE_CONFIG.keys()))
-    return [Send(node_name, state) for node_name in NODE_CONFIG]
+    active_models = state.get("active_models") or _default_active_models()
+    logger.info("LLM fan-out 실행: %s", ", ".join(active_models))
+    return [Send(node_name, state) for node_name in active_models]
 
 
 def build_workflow():
@@ -341,6 +568,9 @@ def build_workflow():
     workflow.add_node("call_anthropic", call_anthropic)
     workflow.add_node("call_upstage", call_upstage)
     workflow.add_node("call_perplexity", call_perplexity)
+    workflow.add_node("call_mistral", call_mistral)
+    workflow.add_node("call_groq", call_groq)
+    workflow.add_node("call_cohere", call_cohere)
 
     workflow.add_conditional_edges("init_question", dispatch_llm_calls)
 
@@ -349,6 +579,9 @@ def build_workflow():
     workflow.add_edge("call_anthropic", END)
     workflow.add_edge("call_upstage", END)
     workflow.add_edge("call_perplexity", END)
+    workflow.add_edge("call_mistral", END)
+    workflow.add_edge("call_groq", END)
+    workflow.add_edge("call_cohere", END)
 
     workflow.set_entry_point("init_question")
     compiled = workflow.compile()
@@ -369,6 +602,58 @@ def get_app():
     if _app is None:
         _app = build_workflow()
     return _app
+
+
+def _should_continue_turn(state: GraphState) -> bool:
+    max_turns = state.get("max_turns") or DEFAULT_MAX_TURNS
+    current_turn = state.get("turn") or 1
+    if current_turn >= max_turns:
+        return False
+    summaries = state.get("self_summaries") or {}
+    return bool(summaries)
+
+
+def _build_next_turn_inputs(state: GraphState, base_question: str) -> GraphState:
+    max_turns = state.get("max_turns") or DEFAULT_MAX_TURNS
+    next_turn = (state.get("turn") or 1) + 1
+    active_models = state.get("active_models") or list(NODE_CONFIG.keys())
+    summaries = state.get("self_summaries") or {}
+
+    history = list(state.get("conversation_history") or [])
+    for label, summary in summaries.items():
+        if summary:
+            history.append({"role": "assistant", "content": f"[{label}] {summary}"})
+
+    summary_lines = [f"- {label}: {text}" for label, text in summaries.items() if text]
+    summary_block = "\n".join(summary_lines).strip()
+
+    next_inputs: dict[str, str] = {}
+    for node_name in active_models:
+        label = NODE_CONFIG[node_name]["label"]
+        own_summary = summaries.get(label, "")
+        prompt_sections = [
+            base_question,
+        ]
+        if summary_block:
+            prompt_sections.append("이전 턴 모델 요약:")
+            prompt_sections.append(summary_block)
+        if own_summary:
+            prompt_sections.append(f"{label} 직전 요약: {own_summary}")
+        prompt_sections.append("가능한 한 새로운 통찰이나 정정을 제안하세요.")
+        next_inputs[label] = "\n\n".join(prompt_sections)
+
+    return GraphState(
+        question=base_question,
+        max_turns=max_turns,
+        turn=next_turn,
+        conversation_history=history,
+        history_summary=state.get("history_summary"),
+        current_inputs=next_inputs,
+        active_models=active_models,
+        raw_responses={},
+        self_summaries={},
+        messages=state.get("messages"),
+    )
 
 
 def _normalize_messages(messages: list | None) -> list[dict[str, str]]:
@@ -426,30 +711,48 @@ async def stream_graph(question: str) -> AsyncIterator[dict[str, Any]]:
         raise ValueError("질문을 입력해주세요.")
 
     logger.info("LangGraph 스트림 실행: %s", _preview(question))
+    base_question = question.strip()
     app = get_app()
-    config = RunnableConfig(recursion_limit=20, configurable={"thread_id": str(create_uuid())})
-    inputs: GraphState = {"question": question.strip()}
+    state_inputs: GraphState = {
+        "question": base_question,
+        "max_turns": DEFAULT_MAX_TURNS,
+        "turn": 1,
+        "active_models": list(NODE_CONFIG.keys()),
+    }
 
-    try:
-        async for event in app.astream(inputs, config=config):
-            for node_name, state in event.items():
-                if node_name not in NODE_CONFIG:
-                    continue
-                meta = NODE_CONFIG[node_name]
-                logger.debug("이벤트 수신: %s", meta["label"])
-                yield {
-                    "model": meta["label"],
-                    "node": node_name,
-                    "answer": state.get(meta["answer_key"]),
-                    "status": state.get(meta["status_key"]) or {},
-                    "messages": _normalize_messages(state.get("messages")),
-                    "type": "partial",
-                }
-    except Exception as exc:
-        logger.error("LangGraph 스트림 오류: %s", exc)
-        yield {
-            "type": "error",
-            "message": str(exc),
-            "node": None,
-            "model": None,
-        }
+    while True:
+        final_state: GraphState | None = None
+        config = RunnableConfig(recursion_limit=20, configurable={"thread_id": str(create_uuid())})
+        try:
+            async for event in app.astream(state_inputs, config=config):
+                turn_index = state_inputs.get("turn") or 1
+                for node_name, state in event.items():
+                    if node_name == "__end__":
+                        final_state = state
+                        continue
+                    if node_name not in NODE_CONFIG:
+                        continue
+                    meta = NODE_CONFIG[node_name]
+                    logger.debug("이벤트 수신: %s (turn=%s)", meta["label"], turn_index)
+                    yield {
+                        "model": meta["label"],
+                        "node": node_name,
+                        "answer": state.get(meta["answer_key"]),
+                        "status": state.get(meta["status_key"]) or {},
+                        "messages": _normalize_messages(state.get("messages")),
+                        "type": "partial",
+                        "turn": turn_index,
+                    }
+        except Exception as exc:
+            logger.error("LangGraph 스트림 오류: %s", exc)
+            yield {
+                "type": "error",
+                "message": str(exc),
+                "node": None,
+                "model": None,
+            }
+            break
+
+        if final_state is None or not _should_continue_turn(final_state):
+            break
+        state_inputs = _build_next_turn_inputs(final_state, base_question)

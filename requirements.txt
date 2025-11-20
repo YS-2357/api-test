@@ -14,6 +14,9 @@ langchain-anthropic>=0.3.10
 langchain-upstage>=0.7.4
 langchain-perplexity>=1.0.0
 langchain-teddynote>=0.3.44
+langchain-mistralai>=0.1.9
+langchain-groq>=0.1.0
+langchain-cohere>=0.3.3
 
 # Environment and utilities
 python-dotenv>=1.0.1

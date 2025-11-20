@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import httpx
 import streamlit as st
@@ -47,14 +48,13 @@ if "partial_data" not in st.session_state:
     st.session_state.partial_data = {}
 if "partial_order" not in st.session_state:
     st.session_state.partial_order = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 
 def render_partial_results() -> str:
-    """현재까지 수신한 부분 결과를 Markdown으로 변환한다.
+    """현재까지 수신한 부분 결과를 Markdown으로 변환한다."""
 
-    Returns:
-        str: 모델별 응답/상태를 정리한 Markdown 문자열.
-    """
     if not st.session_state.partial_data:
         return "LLM 응답을 기다리는 중입니다..."
 
@@ -71,56 +71,108 @@ def render_partial_results() -> str:
         lines.append(f"**{model}** — {status_text}\n\n{answer}")
     return "\n\n---\n\n".join(lines)
 
-question = st.text_area(
-    "질문",
-    placeholder="무엇이든 물어보세요.",
-    height=120,
-    key="question_input",
-)
 
-live_updates_placeholder = st.empty()
-live_updates_placeholder.info("LLM 응답을 대기 중입니다.")
+def format_summary_message(result: dict[str, Any]) -> str:
+    """채팅 이력에 남길 요약 메시지를 Markdown 형태로 생성한다."""
 
-if st.button("그래프 실행", type="primary"):
-    logger.info("그래프 실행 버튼 클릭")
-    st.session_state.last_error = None
-    st.session_state.last_result = None
-    st.session_state.partial_data = {}
-    st.session_state.partial_order = []
-    if not question or not question.strip():
-        st.session_state.last_error = "질문을 입력해주세요."
+    lines: list[str] = []
+    order = result.get("order") or []
+    if order:
+        lines.append("**모델 완료 순서**: " + " → ".join(order))
+
+    primary = result.get("primary_answer")
+    if primary and primary.get("model"):
+        status = primary.get("status") or {}
+        status_code = status.get("status")
+        detail = status.get("detail")
+        status_text = f"{status_code} ({detail})" if detail else status_code
+        lines.append(f"**최초 완료 모델**: {primary.get('model')} — {status_text or '상태 정보 없음'}")
+
+    answers = result.get("answers") or {}
+    if answers:
+        lines.append("### 모델 응답")
+        for model_name, answer in answers.items():
+            lines.append(f"- **{model_name}**\n\n{answer or '응답 없음'}")
     else:
+        lines.append("모델 응답이 없습니다.")
+
+    api_status = result.get("api_status") or {}
+    if api_status:
+        lines.append("### API 상태")
+        for model_name, status in api_status.items():
+            status_code = status.get("status")
+            detail = status.get("detail")
+            status_text = f"{status_code} ({detail})" if detail else status_code
+            lines.append(f"- **{model_name}**: {status_text}")
+
+    errors = result.get("errors") or []
+    if errors:
+        lines.append("### 오류")
+        for error in errors:
+            model = error.get("model") or "알 수 없음"
+            node = error.get("node") or "-"
+            message = error.get("message") or "메시지 없음"
+            lines.append(f"- **{model}** (노드: {node}): {message}")
+
+    return "\n\n".join(lines)
+
+
+chat_container = st.container()
+with chat_container:
+    if st.session_state.chat_history:
+        for entry in st.session_state.chat_history:
+            with st.chat_message(entry["role"]):
+                st.markdown(entry["content"])
+    else:
+        st.info("질문을 입력하고 그래프를 실행해보세요.")
+    partial_placeholder = st.empty()
+    if st.session_state.partial_data:
+        partial_placeholder.markdown(render_partial_results())
+
+prompt = st.chat_input("무엇이든 물어보세요.")
+
+if prompt is not None:
+    question = prompt.strip()
+    if not question:
+        st.warning("질문을 입력해주세요.")
+    else:
+        logger.info("챗 입력 수신")
+        st.session_state.chat_history.append({"role": "user", "content": question})
+        st.session_state.last_error = None
+        st.session_state.last_result = None
+        st.session_state.partial_data = {}
+        st.session_state.partial_order = []
+        partial_placeholder.info("LLM 응답을 대기 중입니다.")
         try:
-            with st.spinner("그래프 실행 중... (부분 응답이 순차적으로 표시됩니다)"):
-                with httpx.stream(
-                    "POST",
-                    API_URL,
-                    json={"question": question.strip()},
-                    headers={"Content-Type": "application/json"},
-                    timeout=180.0,
-                ) as response:
-                    response.raise_for_status()
-                    for line in response.iter_text():
-                        if not line:
-                            continue
-                        event = json.loads(line)
-                        event_type = event.get("type", "partial")
-                        if event_type == "partial":
-                            model = event.get("model")
-                            if model and model not in st.session_state.partial_order:
-                                st.session_state.partial_order.append(model)
-                            if model:
-                                st.session_state.partial_data[model] = event
-                                logger.debug("부분 응답 갱신: %s", model)
-                            live_updates_placeholder.markdown(render_partial_results())
-                        elif event_type == "summary":
-                            st.session_state.last_result = event.get("result")
-                            logger.info("요약 이벤트 수신")
-                        elif event_type == "error":
-                            st.session_state.last_error = event.get("message", "알 수 없는 오류가 발생했습니다.")
-                            # 오류 이벤트가 와도 요약을 위해 스트림을 계속 읽는다.
-                            logger.warning("오류 이벤트 수신: %s", st.session_state.last_error)
-                            continue
+            with httpx.stream(
+                "POST",
+                API_URL,
+                json={"question": question},
+                headers={"Content-Type": "application/json"},
+                timeout=180.0,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_text():
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    event_type = event.get("type", "partial")
+                    if event_type == "partial":
+                        model = event.get("model")
+                        if model and model not in st.session_state.partial_order:
+                            st.session_state.partial_order.append(model)
+                        if model:
+                            st.session_state.partial_data[model] = event
+                            logger.debug("부분 응답 갱신: %s", model)
+                        partial_placeholder.markdown(render_partial_results())
+                    elif event_type == "summary":
+                        st.session_state.last_result = event.get("result")
+                        logger.info("요약 이벤트 수신")
+                    elif event_type == "error":
+                        error_message = event.get("message", "알 수 없는 오류가 발생했습니다.")
+                        st.session_state.last_error = error_message
+                        logger.warning("오류 이벤트 수신: %s", error_message)
+                        continue
         except httpx.HTTPStatusError as http_error:
             response = http_error.response
             try:
@@ -141,75 +193,23 @@ if st.button("그래프 실행", type="primary"):
             logger.error("기타 요청 오류: %s", request_error)
         finally:
             if not st.session_state.partial_data:
-                live_updates_placeholder.info("LLM 응답을 대기 중입니다.")
+                partial_placeholder.empty()
             else:
-                live_updates_placeholder.markdown(render_partial_results())
-
-if st.session_state.last_error:
-    st.error(st.session_state.last_error)
-elif st.session_state.partial_data:
-    live_updates_placeholder.markdown(render_partial_results())
+                partial_placeholder.markdown(render_partial_results())
 
 result = st.session_state.last_result
 if result:
-    completion_order = result.get("order") or []
-    if completion_order:
-        st.caption("모델 완료 순서: " + " → ".join(completion_order))
-    errors = result.get("errors") or []
-    if errors:
-        st.warning(
-            "일부 모델 호출에서 오류가 발생했습니다. 세부 정보는 아래 오류 목록을 확인하세요."
-        )
-    primary = result.get("primary_answer")
-    if primary:
-        st.subheader("최초 완료 모델")
-        model_name = primary.get("model")
-        st.write(
-            f"- **{model_name}**: {primary.get('answer') or '응답 없음'}"
-            if model_name
-            else primary.get("answer") or "응답 없음"
-        )
-        status = primary.get("status") or {}
-        if status:
-            st.caption(
-                f"상태: {status.get('status')} ({status.get('detail')})"
-                if status.get("detail")
-                else f"상태: {status.get('status')}"
-            )
+    summary_markdown = format_summary_message(result)
+    st.session_state.chat_history.append({"role": "assistant", "content": summary_markdown})
+    st.session_state.last_result = None
+    st.session_state.partial_data = {}
+    st.session_state.partial_order = []
+    partial_placeholder.empty()
+    st.rerun()
 
-    st.subheader("모델 응답")
-    answers = result.get("answers") or {}
-    if answers:
-        for model_name, answer in answers.items():
-            with st.expander(model_name, expanded=False):
-                st.write(answer or "응답 없음")
-    else:
-        st.info("응답 데이터가 없습니다.")
-
-    st.subheader("API 상태")
-    api_status = result.get("api_status") or {}
-    if api_status:
-        for model_name, status in api_status.items():
-            status_code = status.get("status")
-            detail = status.get("detail")
-            st.write(f"- **{model_name}**: {status_code} ({detail})" if detail else f"- **{model_name}**: {status_code}")
-    else:
-        st.info("상태 데이터가 없습니다.")
-
-    st.subheader("메시지 로그")
-    messages = result.get("messages") or []
-    if messages:
-        for message in messages:
-            st.write(f"{message.get('role')}: {message.get('content')}")
-    else:
-        st.info("메시지 로그가 없습니다.")
-
-    if errors:
-        st.subheader("오류 로그")
-        for error in errors:
-            model = error.get("model") or "알 수 없음"
-            node = error.get("node") or "-"
-            message = error.get("message") or "메시지 없음"
-            st.write(f"- **{model}** (노드: {node}): {message}")
-else:
-    st.info("질문을 입력하고 그래프를 실행해보세요.")
+if st.session_state.last_error:
+    error_text = st.session_state.last_error
+    st.session_state.chat_history.append({"role": "assistant", "content": f"❌ {error_text}"})
+    st.session_state.last_error = None
+    partial_placeholder.empty()
+    st.rerun()
