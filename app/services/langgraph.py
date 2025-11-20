@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Iterator, TypedDict, cast
+import asyncio
+from typing import Annotated, Any, AsyncIterator, TypedDict, cast
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -14,6 +15,9 @@ from langchain_teddynote.models import ChatPerplexity
 from langchain_upstage import ChatUpstage
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Send
+
+from app.logger import get_logger
 
 # LangSmith UUID v7 지원
 try:
@@ -26,6 +30,15 @@ load_dotenv()
 
 # LangSmith 추적 설정 (노트북 파일 기준)
 logging.langsmith("API-LangGraph-Test")
+
+logger = get_logger(__name__)
+
+
+def _preview(text: str, limit: int = 80) -> str:
+    """긴 문자열을 로그에 표시하기 위한 요약 버전으로 변환한다."""
+
+    compact = " ".join(text.split())
+    return compact[:limit] + ("…" if len(compact) > limit else "")
 
 
 class GraphState(TypedDict, total=False):
@@ -114,13 +127,23 @@ def init_question(state: GraphState) -> GraphState:
     if not question:
         raise ValueError("질문이 비어 있습니다.")
 
+    logger.debug("질문 초기화: %s", _preview(question))
     return GraphState(
         question=question,
         messages=[("user", question)],
     )
 
 
-def call_openai(state: GraphState) -> GraphState:
+async def _ainvoke(llm: Any, question: str) -> Any:
+    """주어진 LLM에서 비동기 호출을 수행한다."""
+
+    if hasattr(llm, "ainvoke"):
+        return await llm.ainvoke(question)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, llm.invoke, question)
+
+
+async def call_openai(state: GraphState) -> GraphState:
     """OpenAI 모델을 호출하고 응답/상태를 반환한다.
 
     Args:
@@ -131,10 +154,12 @@ def call_openai(state: GraphState) -> GraphState:
     """
     question = state["question"]
     llm = ChatOpenAI(model="gpt-5-nano")
+    logger.debug("OpenAI 호출 시작")
     try:
-        response = llm.invoke(question)
+        response = await _ainvoke(llm, question)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        logger.info("OpenAI 응답 완료: %s", status.get("detail"))
         return GraphState(
             openai_answer=content,
             openai_status=status,
@@ -142,13 +167,14 @@ def call_openai(state: GraphState) -> GraphState:
         )
     except Exception as exc:
         status = build_status_from_error(exc)
+        logger.warning("OpenAI 호출 실패: %s", exc)
         return GraphState(
             openai_status=status,
             messages=[format_response_message("OpenAI 오류", exc)],
         )
 
 
-def call_gemini(state: GraphState) -> GraphState:
+async def call_gemini(state: GraphState) -> GraphState:
     """Google Gemini 모델을 호출한다.
 
     Args:
@@ -159,10 +185,12 @@ def call_gemini(state: GraphState) -> GraphState:
     """
     question = state["question"]
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    logger.debug("Gemini 호출 시작")
     try:
-        response = llm.invoke(question)
+        response = await _ainvoke(llm, question)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        logger.info("Gemini 응답 완료: %s", status.get("detail"))
         return GraphState(
             gemini_answer=content,
             gemini_status=status,
@@ -170,13 +198,14 @@ def call_gemini(state: GraphState) -> GraphState:
         )
     except Exception as exc:
         status = build_status_from_error(exc)
+        logger.warning("Gemini 호출 실패: %s", exc)
         return GraphState(
             gemini_status=status,
             messages=[format_response_message("Gemini 오류", exc)],
         )
 
 
-def call_anthropic(state: GraphState) -> GraphState:
+async def call_anthropic(state: GraphState) -> GraphState:
     """Anthropic Claude 모델을 호출한다.
 
     Args:
@@ -187,10 +216,12 @@ def call_anthropic(state: GraphState) -> GraphState:
     """
     question = state["question"]
     llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+    logger.debug("Anthropic 호출 시작")
     try:
-        response = llm.invoke(question)
+        response = await _ainvoke(llm, question)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        logger.info("Anthropic 응답 완료: %s", status.get("detail"))
         return GraphState(
             anthropic_answer=content,
             anthropic_status=status,
@@ -198,13 +229,14 @@ def call_anthropic(state: GraphState) -> GraphState:
         )
     except Exception as exc:
         status = build_status_from_error(exc)
+        logger.warning("Anthropic 호출 실패: %s", exc)
         return GraphState(
             anthropic_status=status,
             messages=[format_response_message("Anthropic 오류", exc)],
         )
 
 
-def call_upstage(state: GraphState) -> GraphState:
+async def call_upstage(state: GraphState) -> GraphState:
     """Upstage Solar 모델을 호출한다.
 
     Args:
@@ -215,10 +247,12 @@ def call_upstage(state: GraphState) -> GraphState:
     """
     question = state["question"]
     llm = ChatUpstage(model="solar-mini")
+    logger.debug("Upstage 호출 시작")
     try:
-        response = llm.invoke(question)
+        response = await _ainvoke(llm, question)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        logger.info("Upstage 응답 완료: %s", status.get("detail"))
         return GraphState(
             upstage_answer=content,
             upstage_status=status,
@@ -226,13 +260,14 @@ def call_upstage(state: GraphState) -> GraphState:
         )
     except Exception as exc:
         status = build_status_from_error(exc)
+        logger.warning("Upstage 호출 실패: %s", exc)
         return GraphState(
             upstage_status=status,
             messages=[format_response_message("Upstage 오류", exc)],
         )
 
 
-def call_perplexity(state: GraphState) -> GraphState:
+async def call_perplexity(state: GraphState) -> GraphState:
     """Perplexity Sonar 모델을 호출한다.
 
     Args:
@@ -252,10 +287,12 @@ def call_perplexity(state: GraphState) -> GraphState:
         top_k=0,
         stream=False,
     )
+    logger.debug("Perplexity 호출 시작")
     try:
-        response = llm.invoke(question)
+        response = await _ainvoke(llm, question)
         content = response.content if hasattr(response, "content") else str(response)
         status = build_status_from_response(response)
+        logger.info("Perplexity 응답 완료: %s", status.get("detail"))
         return GraphState(
             perplexity_answer=content,
             perplexity_status=status,
@@ -263,6 +300,7 @@ def call_perplexity(state: GraphState) -> GraphState:
         )
     except Exception as exc:
         status = build_status_from_error(exc)
+        logger.warning("Perplexity 호출 실패: %s", exc)
         return GraphState(
             perplexity_status=status,
             messages=[format_response_message("Perplexity 오류", exc)],
@@ -273,13 +311,20 @@ NODE_CONFIG: dict[str, dict[str, str]] = {
     "call_openai": {"label": "OpenAI", "answer_key": "openai_answer", "status_key": "openai_status"},
     "call_gemini": {"label": "Gemini", "answer_key": "gemini_answer", "status_key": "gemini_status"},
     "call_anthropic": {"label": "Anthropic", "answer_key": "anthropic_answer", "status_key": "anthropic_status"},
-    "call_perplexity": {
-        "label": "Perplexity",
-        "answer_key": "perplexity_answer",
-        "status_key": "perplexity_status",
-    },
+    "call_perplexity": {"label": "Perplexity", "answer_key": "perplexity_answer", "status_key": "perplexity_status"},
     "call_upstage": {"label": "Upstage", "answer_key": "upstage_answer", "status_key": "upstage_status"},
 }
+
+
+def dispatch_llm_calls(state: GraphState) -> list[Send]:
+    """Send API를 활용해 각 LLM 노드를 동시에 실행할 태스크 목록을 생성한다."""
+
+    question = state.get("question")
+    if not question:
+        raise ValueError("질문이 비어 있습니다.")
+    # 동일한 상태를 각 노드에 전달해 LangGraph가 병렬 실행하도록 지시
+    logger.info("LLM fan-out 실행: %s", ", ".join(NODE_CONFIG.keys()))
+    return [Send(node_name, state) for node_name in NODE_CONFIG]
 
 
 def build_workflow():
@@ -288,6 +333,7 @@ def build_workflow():
     Returns:
         Any: 컴파일된 LangGraph 애플리케이션.
     """
+    logger.debug("LangGraph 워크플로우 컴파일 시작")
     workflow = StateGraph(GraphState)
     workflow.add_node("init_question", init_question)
     workflow.add_node("call_openai", call_openai)
@@ -296,11 +342,7 @@ def build_workflow():
     workflow.add_node("call_upstage", call_upstage)
     workflow.add_node("call_perplexity", call_perplexity)
 
-    workflow.add_edge("init_question", "call_openai")
-    workflow.add_edge("init_question", "call_gemini")
-    workflow.add_edge("init_question", "call_anthropic")
-    workflow.add_edge("init_question", "call_upstage")
-    workflow.add_edge("init_question", "call_perplexity")
+    workflow.add_conditional_edges("init_question", dispatch_llm_calls)
 
     workflow.add_edge("call_openai", END)
     workflow.add_edge("call_gemini", END)
@@ -309,7 +351,9 @@ def build_workflow():
     workflow.add_edge("call_perplexity", END)
 
     workflow.set_entry_point("init_question")
-    return workflow.compile()
+    compiled = workflow.compile()
+    logger.info("LangGraph 워크플로우 컴파일 완료")
+    return compiled
 
 
 _app = None
@@ -366,7 +410,7 @@ def _extend_unique_messages(
         target.append({"role": role, "content": content})
 
 
-def stream_graph(question: str) -> Iterator[dict[str, Any]]:
+async def stream_graph(question: str) -> AsyncIterator[dict[str, Any]]:
     """질문을 받아 LangGraph 워크플로우에서 발생하는 이벤트를 스트리밍한다.
 
     Args:
@@ -381,67 +425,31 @@ def stream_graph(question: str) -> Iterator[dict[str, Any]]:
     if not question or not question.strip():
         raise ValueError("질문을 입력해주세요.")
 
+    logger.info("LangGraph 스트림 실행: %s", _preview(question))
     app = get_app()
     config = RunnableConfig(recursion_limit=20, configurable={"thread_id": str(create_uuid())})
     inputs: GraphState = {"question": question.strip()}
 
-    for event in app.stream(inputs, config=config):
-        for node_name, state in event.items():
-            if node_name not in NODE_CONFIG:
-                continue
-            meta = NODE_CONFIG[node_name]
-            yield {
-                "model": meta["label"],
-                "node": node_name,
-                "answer": state.get(meta["answer_key"]),
-                "status": state.get(meta["status_key"]) or {},
-                "messages": _normalize_messages(state.get("messages")),
-                "type": "partial",
-            }
-
-
-def _aggregate_stream(question: str, partial_events: list[dict[str, Any]]) -> dict[str, Any]:
-    """부분 이벤트를 최종 응답 형태로 변환한다.
-
-    Args:
-        question: 사용자 질문.
-        partial_events: `stream_graph`에서 수집한 partial 이벤트 목록.
-
-    Returns:
-        dict[str, Any]: `/api/ask` 기존 JSON 응답과 동일한 구조.
-    """
-    answers: dict[str, Any] = {}
-    api_status: dict[str, Any] = {}
-    messages: list[dict[str, str]] = [{"role": "user", "content": question}]
-    seen_messages: set[tuple[str, str]] = {("user", question)}
-
-    for event in partial_events:
-        model = event.get("model")
-        if not model:
-            continue
-        answers[model] = event.get("answer")
-        status = event.get("status")
-        if status:
-            api_status[model] = status
-        _extend_unique_messages(messages, event.get("messages"), seen_messages)
-
-    return {
-        "question": question,
-        "answers": answers,
-        "api_status": api_status,
-        "messages": messages,
-    }
-
-
-def run_graph(question: str) -> dict[str, Any]:
-    """질문 전체를 실행하고 최종 결과를 반환한다.
-
-    Args:
-        question: 사용자 질문 문자열.
-
-    Returns:
-        dict[str, Any]: question/answers/api_status/messages 필드를 포함한 최종 응답.
-    """
-    question_normalized = question.strip()
-    partials = list(stream_graph(question_normalized))
-    return _aggregate_stream(question_normalized, partials)
+    try:
+        async for event in app.astream(inputs, config=config):
+            for node_name, state in event.items():
+                if node_name not in NODE_CONFIG:
+                    continue
+                meta = NODE_CONFIG[node_name]
+                logger.debug("이벤트 수신: %s", meta["label"])
+                yield {
+                    "model": meta["label"],
+                    "node": node_name,
+                    "answer": state.get(meta["answer_key"]),
+                    "status": state.get(meta["status_key"]) or {},
+                    "messages": _normalize_messages(state.get("messages")),
+                    "type": "partial",
+                }
+    except Exception as exc:
+        logger.error("LangGraph 스트림 오류: %s", exc)
+        yield {
+            "type": "error",
+            "message": str(exc),
+            "node": None,
+            "model": None,
+        }

@@ -8,9 +8,18 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.logger import get_logger
 from app.services import stream_graph
 
 router = APIRouter()
+logger = get_logger(__name__)
+
+
+def _preview(text: str, limit: int = 80) -> str:
+    """로그 출력을 위해 문자열을 요약한다."""
+
+    compact = " ".join(text.split())
+    return compact[:limit] + ("…" if len(compact) > limit else "")
 
 
 class AskRequest(BaseModel):
@@ -45,11 +54,15 @@ async def ask_question(payload: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="질문을 입력해주세요.")
 
-    def response_stream():
+    logger.info("질문 수신: %s", _preview(question))
+
+    async def response_stream():
         answers = {}
         api_status = {}
         messages = [{"role": "user", "content": question}]
         seen_messages = {("user", question)}
+        completion_order: list[str] = []
+        errors: list[dict[str, str | None]] = []
 
         def extend_messages(new_messages: list[dict[str, str]] | None):
             for message in new_messages or []:
@@ -62,16 +75,56 @@ async def ask_question(payload: AskRequest):
                 messages.append({"role": role, "content": content})
 
         try:
-            for event in stream_graph(question):
-                model = event.get("model")
-                if model:
-                    answers[model] = event.get("answer")
-                    status = event.get("status")
-                    if status:
-                        api_status[model] = status
-                extend_messages(event.get("messages"))
+            async for event in stream_graph(question):
+                event_type = event.get("type", "partial")
+                if event_type == "partial":
+                    model = event.get("model")
+                    if model:
+                        if model not in completion_order:
+                            completion_order.append(model)
+                        answers[model] = event.get("answer")
+                        status = event.get("status")
+                        if status:
+                            api_status[model] = status
+                        logger.debug("부분 응답 누적: %s", model)
+                    extend_messages(event.get("messages"))
+                elif event_type == "error":
+                    logger.warning(
+                        "스트림 오류 이벤트 수신 (node=%s, model=%s): %s",
+                        event.get("node"),
+                        event.get("model"),
+                        event.get("message"),
+                    )
+                    errors.append(
+                        {
+                            "message": event.get("message"),
+                            "node": event.get("node"),
+                            "model": event.get("model"),
+                        }
+                    )
                 yield json.dumps(event, ensure_ascii=False) + "\n"
-
+        except Exception as exc:  # pragma: no cover
+            error_event = {"type": "error", "message": str(exc), "node": None, "model": None}
+            errors.append(
+                {
+                    "message": str(exc),
+                    "node": None,
+                    "model": None,
+                }
+            )
+            logger.error("응답 스트림 처리 중 오류: %s", exc)
+            yield json.dumps(error_event, ensure_ascii=False) + "\n"
+        finally:
+            primary_model = next((model for model in completion_order if answers.get(model)), None)
+            primary_answer = (
+                {
+                    "model": primary_model,
+                    "answer": answers.get(primary_model),
+                    "status": api_status.get(primary_model),
+                }
+                if primary_model
+                else None
+            )
             summary = {
                 "type": "summary",
                 "result": {
@@ -79,11 +132,13 @@ async def ask_question(payload: AskRequest):
                     "answers": answers,
                     "api_status": api_status,
                     "messages": messages,
+                    "order": completion_order,
+                    "primary_model": primary_model,
+                    "primary_answer": primary_answer,
+                    "errors": errors,
                 },
             }
+            logger.info("요약 응답 전송 - 완료 모델 수: %d, 오류 수: %d", len(answers), len(errors))
             yield json.dumps(summary, ensure_ascii=False) + "\n"
-        except Exception as exc:  # pragma: no cover
-            error_event = {"type": "error", "message": str(exc)}
-            yield json.dumps(error_event, ensure_ascii=False) + "\n"
 
     return StreamingResponse(response_stream(), media_type="application/json")

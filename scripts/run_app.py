@@ -11,11 +11,13 @@ from pathlib import Path
 import uvicorn
 
 from app.config import get_settings
+from app.logger import get_logger
 from app.main import app as fastapi_app
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 STREAMLIT_SCRIPT = BASE_DIR / "app" / "ui" / "streamlit_app.py"
 FASTAPI_URL_FILE = BASE_DIR / ".fastapi_url"
+logger = get_logger(__name__)
 
 
 def run_fastapi(host: str, port: int) -> None:
@@ -28,6 +30,7 @@ def run_fastapi(host: str, port: int) -> None:
     Returns:
         None
     """
+    logger.info("FastAPI 서버 시작: http://%s:%s", host, port)
     config = uvicorn.Config(fastapi_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
     server.run()
@@ -67,6 +70,7 @@ def run_streamlit(port: int, env: dict[str, str]) -> None:
         str(port),
         "--server.headless=true",
     ]
+    logger.info("Streamlit 실행: 포트 %s", port)
     subprocess.run(cmd, check=False, env=env)
 
 
@@ -104,14 +108,14 @@ def main() -> None:
     )
     api_thread.start()
 
-    print(f"[INFO] FastAPI: http://{host}:{fastapi_port}")
-    print(f"[INFO] Streamlit: http://{host}:{streamlit_port}")
-    print(f"[INFO] FastAPI URL이 설정되었습니다: {fastapi_url}")
+    logger.info("FastAPI: http://%s:%s", host, fastapi_port)
+    logger.info("Streamlit: http://%s:%s", host, streamlit_port)
+    logger.info("FastAPI URL이 설정되었습니다: %s", fastapi_url)
 
     try:
         run_streamlit(streamlit_port, env)
     except KeyboardInterrupt:
-        pass
+        logger.warning("사용자 중단 감지, Streamlit 종료")
 
 
 if __name__ == "__main__":
