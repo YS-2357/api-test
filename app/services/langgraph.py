@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Annotated, Any, AsyncIterator, TypedDict, cast
 
 from dotenv import load_dotenv
@@ -60,7 +61,7 @@ async def _summarize_content(llm: Any, content: str, label: str) -> str:
     """모델 응답을 짧게 요약한다."""
 
     summary_prompt = (
-        "다음 답변을 핵심만 2문장 이하로 매우 간결하게 요약하세요.\n\n"
+        "다음 답변을 핵심만 2문장 이하(400자 이내)로 매우 간결하게 요약하세요.\n\n"
         f"답변:\n{content}\n"
     )
     try:
@@ -604,56 +605,45 @@ def get_app():
     return _app
 
 
-def _should_continue_turn(state: GraphState) -> bool:
-    max_turns = state.get("max_turns") or DEFAULT_MAX_TURNS
-    current_turn = state.get("turn") or 1
-    if current_turn >= max_turns:
-        return False
-    summaries = state.get("self_summaries") or {}
-    return bool(summaries)
+async def _summarize_history(history: list[dict[str, str]] | None, limit: int = 400) -> str | None:
+    """과거 대화 이력을 2문장 이내로 요약한다."""
+
+    if not history:
+        return None
+
+    text_lines = [f"{item.get('role')}: {item.get('content')}" for item in history if item.get("content")]
+    history_text = "\n".join(text_lines)
+    prompt = (
+        "다음 대화 이력을 2문장 이하, 400자 이내로 요약하세요. 핵심 논점만 남기고 세부사항은 생략합니다.\n\n"
+        f"{history_text}"
+    )
+    llm = ChatOpenAI(model="gpt-5-nano", temperature=0)
+    try:
+        response = await _ainvoke(llm, prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        return str(content)[:limit]
+    except Exception as exc:  # pragma: no cover - 요약 실패 시 안전 폴백
+        logger.warning("대화 요약 실패, 원본을 절단해 사용합니다: %s", exc)
+        compact = " ".join(history_text.split())
+        return compact[:limit]
 
 
-def _build_next_turn_inputs(state: GraphState, base_question: str) -> GraphState:
-    max_turns = state.get("max_turns") or DEFAULT_MAX_TURNS
-    next_turn = (state.get("turn") or 1) + 1
-    active_models = state.get("active_models") or list(NODE_CONFIG.keys())
-    summaries = state.get("self_summaries") or {}
+def _build_current_inputs(question: str, history_summary: str | None, active_models: list[str]) -> dict[str, str]:
+    """현 턴에서 사용할 모델별 입력 프롬프트를 생성한다."""
 
-    history = list(state.get("conversation_history") or [])
-    for label, summary in summaries.items():
-        if summary:
-            history.append({"role": "assistant", "content": f"[{label}] {summary}"})
-
-    summary_lines = [f"- {label}: {text}" for label, text in summaries.items() if text]
-    summary_block = "\n".join(summary_lines).strip()
-
-    next_inputs: dict[str, str] = {}
+    prompts: dict[str, str] = {}
+    history_block = f"이전 대화 요약: {history_summary}" if history_summary else ""
     for node_name in active_models:
         label = NODE_CONFIG[node_name]["label"]
-        own_summary = summaries.get(label, "")
-        prompt_sections = [
-            base_question,
-        ]
-        if summary_block:
-            prompt_sections.append("이전 턴 모델 요약:")
-            prompt_sections.append(summary_block)
-        if own_summary:
-            prompt_sections.append(f"{label} 직전 요약: {own_summary}")
-        prompt_sections.append("가능한 한 새로운 통찰이나 정정을 제안하세요.")
-        next_inputs[label] = "\n\n".join(prompt_sections)
-
-    return GraphState(
-        question=base_question,
-        max_turns=max_turns,
-        turn=next_turn,
-        conversation_history=history,
-        history_summary=state.get("history_summary"),
-        current_inputs=next_inputs,
-        active_models=active_models,
-        raw_responses={},
-        self_summaries={},
-        messages=state.get("messages"),
-    )
+        sections = [question]
+        if history_block:
+            sections.append(history_block)
+        sections.append(
+            "사용자 질문에 최신 답변을 제시하세요. 필요하면 이전 맥락을 반영하세요."
+        )
+        sections.append("응답은 5문장 이하, 600자 이내로 간결하게 작성하세요.")
+        prompts[label] = "\n\n".join([part for part in sections if part])
+    return prompts
 
 
 def _normalize_messages(messages: list | None) -> list[dict[str, str]]:
@@ -695,11 +685,16 @@ def _extend_unique_messages(
         target.append({"role": role, "content": content})
 
 
-async def stream_graph(question: str) -> AsyncIterator[dict[str, Any]]:
+async def stream_graph(
+    question: str, *, turn: int = 1, max_turns: int | None = None, history: list[dict[str, str]] | None = None
+) -> AsyncIterator[dict[str, Any]]:
     """질문을 받아 LangGraph 워크플로우에서 발생하는 이벤트를 스트리밍한다.
 
     Args:
         question: 사용자 질문 문자열.
+        turn: 현재 턴 인덱스(사용자 입력 횟수).
+        max_turns: 허용되는 최대 턴 수.
+        history: 이전 대화 이력(`role`, `content`).
 
     Yields:
         dict[str, Any]: `type=partial` 이벤트(모델명/응답/상태/메시지).
@@ -710,49 +705,60 @@ async def stream_graph(question: str) -> AsyncIterator[dict[str, Any]]:
     if not question or not question.strip():
         raise ValueError("질문을 입력해주세요.")
 
+    resolved_max_turns = max_turns or DEFAULT_MAX_TURNS
+    if turn > resolved_max_turns:
+        warning = f"최대 턴({resolved_max_turns})을 초과했습니다. 새 질문으로 시작해주세요."
+        logger.warning("턴 초과 - 실행 중단: turn=%s, max=%s", turn, resolved_max_turns)
+        yield {"type": "error", "message": warning, "node": None, "model": None, "turn": turn}
+        return
+
     logger.info("LangGraph 스트림 실행: %s", _preview(question))
     base_question = question.strip()
     app = get_app()
+    start_time = time.perf_counter()
+    active_models = list(NODE_CONFIG.keys())
+    history_summary = await _summarize_history(history)
+    current_inputs = _build_current_inputs(base_question, history_summary, active_models)
+    conversation_history = list(history or [])
+    conversation_history.append({"role": "user", "content": base_question})
     state_inputs: GraphState = {
         "question": base_question,
-        "max_turns": DEFAULT_MAX_TURNS,
-        "turn": 1,
-        "active_models": list(NODE_CONFIG.keys()),
+        "max_turns": resolved_max_turns,
+        "turn": turn,
+        "conversation_history": conversation_history,
+        "history_summary": history_summary,
+        "current_inputs": current_inputs,
+        "active_models": active_models,
     }
 
-    while True:
-        final_state: GraphState | None = None
-        config = RunnableConfig(recursion_limit=20, configurable={"thread_id": str(create_uuid())})
-        try:
-            async for event in app.astream(state_inputs, config=config):
-                turn_index = state_inputs.get("turn") or 1
-                for node_name, state in event.items():
-                    if node_name == "__end__":
-                        final_state = state
-                        continue
-                    if node_name not in NODE_CONFIG:
-                        continue
-                    meta = NODE_CONFIG[node_name]
-                    logger.debug("이벤트 수신: %s (turn=%s)", meta["label"], turn_index)
-                    yield {
-                        "model": meta["label"],
-                        "node": node_name,
-                        "answer": state.get(meta["answer_key"]),
-                        "status": state.get(meta["status_key"]) or {},
-                        "messages": _normalize_messages(state.get("messages")),
-                        "type": "partial",
-                        "turn": turn_index,
-                    }
-        except Exception as exc:
-            logger.error("LangGraph 스트림 오류: %s", exc)
-            yield {
-                "type": "error",
-                "message": str(exc),
-                "node": None,
-                "model": None,
-            }
-            break
-
-        if final_state is None or not _should_continue_turn(final_state):
-            break
-        state_inputs = _build_next_turn_inputs(final_state, base_question)
+    config = RunnableConfig(recursion_limit=20, configurable={"thread_id": str(create_uuid())})
+    try:
+        async for event in app.astream(state_inputs, config=config):
+            turn_index = state_inputs.get("turn") or 1
+            for node_name, state in event.items():
+                if node_name == "__end__":
+                    continue
+                if node_name not in NODE_CONFIG:
+                    continue
+                meta = NODE_CONFIG[node_name]
+                logger.debug("이벤트 수신: %s (turn=%s)", meta["label"], turn_index)
+                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                yield {
+                    "model": meta["label"],
+                    "node": node_name,
+                    "answer": state.get(meta["answer_key"]),
+                    "status": state.get(meta["status_key"]) or {},
+                    "messages": _normalize_messages(state.get("messages")),
+                    "type": "partial",
+                    "turn": turn_index,
+                    "elapsed_ms": elapsed_ms,
+                }
+    except Exception as exc:
+        logger.error("LangGraph 스트림 오류: %s", exc)
+        yield {
+            "type": "error",
+            "message": str(exc),
+            "node": None,
+            "model": None,
+            "turn": turn,
+        }

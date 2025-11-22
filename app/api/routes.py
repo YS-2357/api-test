@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.logger import get_logger
 from app.services import stream_graph
+from app.services.langgraph import DEFAULT_MAX_TURNS
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -26,6 +27,9 @@ class AskRequest(BaseModel):
     """질문을 포함하는 요청 스키마."""
 
     question: str
+    turn: int | None = None
+    max_turns: int | None = None
+    history: list[dict[str, str]] | None = None
 
 
 @router.get("/health")
@@ -54,11 +58,18 @@ async def ask_question(payload: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="질문을 입력해주세요.")
 
+    turn = payload.turn or 1
+    max_turns = payload.max_turns or DEFAULT_MAX_TURNS
+    history = payload.history or []
+    if turn < 1:
+        turn = 1
+
     logger.info("질문 수신: %s", _preview(question))
 
     async def response_stream():
         answers = {}
         api_status = {}
+        durations_ms: dict[str, int] = {}
         messages = [{"role": "user", "content": question}]
         seen_messages = {("user", question)}
         completion_order: list[str] = []
@@ -75,7 +86,7 @@ async def ask_question(payload: AskRequest):
                 messages.append({"role": role, "content": content})
 
         try:
-            async for event in stream_graph(question):
+            async for event in stream_graph(question, turn=turn, max_turns=max_turns, history=history):
                 event_type = event.get("type", "partial")
                 if event_type == "partial":
                     model = event.get("model")
@@ -86,6 +97,9 @@ async def ask_question(payload: AskRequest):
                         status = event.get("status")
                         if status:
                             api_status[model] = status
+                        elapsed_ms = event.get("elapsed_ms")
+                        if elapsed_ms is not None:
+                            durations_ms[model] = int(elapsed_ms)
                         logger.debug("부분 응답 누적: %s", model)
                     extend_messages(event.get("messages"))
                 elif event_type == "error":
@@ -131,11 +145,14 @@ async def ask_question(payload: AskRequest):
                     "question": question,
                     "answers": answers,
                     "api_status": api_status,
+                    "durations_ms": durations_ms,
                     "messages": messages,
                     "order": completion_order,
                     "primary_model": primary_model,
                     "primary_answer": primary_answer,
                     "errors": errors,
+                    "turn": turn,
+                    "max_turns": max_turns,
                 },
             }
             logger.info("요약 응답 전송 - 완료 모델 수: %d, 오류 수: %d", len(answers), len(errors))

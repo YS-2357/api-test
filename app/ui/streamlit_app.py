@@ -32,6 +32,7 @@ def load_api_url() -> str:
 
 
 API_URL = load_api_url()
+MAX_TURNS = 3
 logger = get_logger(__name__)
 logger.info("Streamlit UI 초기화 - FastAPI URL: %s", API_URL)
 
@@ -68,6 +69,17 @@ def render_partial_results() -> str:
         status_code = status.get("status") or "대기"
         detail = status.get("detail")
         status_text = f"{status_code} ({detail})" if detail else status_code
+        if str(status_code).lower() in {"error"} or (isinstance(status_code, int) and status_code >= 400):
+            status_text = f"❌ {status_text}"
+        elif status_code not in {"대기", "pending"}:
+            status_text = f"✅ {status_text}"
+        elapsed = event.get("elapsed_ms")
+        if elapsed is not None:
+            if elapsed >= 1000:
+                time_text = f"{elapsed/1000:.1f}s"
+            else:
+                time_text = f"{elapsed}ms"
+            status_text = f"{status_text} · {time_text}"
         lines.append(f"**{model}** — {status_text}\n\n{answer}")
     return "\n\n---\n\n".join(lines)
 
@@ -89,21 +101,44 @@ def format_summary_message(result: dict[str, Any]) -> str:
         lines.append(f"**최초 완료 모델**: {primary.get('model')} — {status_text or '상태 정보 없음'}")
 
     answers = result.get("answers") or {}
-    if answers:
-        lines.append("### 모델 응답")
-        for model_name, answer in answers.items():
-            lines.append(f"- **{model_name}**\n\n{answer or '응답 없음'}")
-    else:
-        lines.append("모델 응답이 없습니다.")
-
     api_status = result.get("api_status") or {}
-    if api_status:
-        lines.append("### API 상태")
-        for model_name, status in api_status.items():
-            status_code = status.get("status")
-            detail = status.get("detail")
-            status_text = f"{status_code} ({detail})" if detail else status_code
-            lines.append(f"- **{model_name}**: {status_text}")
+    durations = result.get("durations_ms") or {}
+
+    models = list(order)
+    for model_name in answers.keys():
+        if model_name not in models:
+            models.append(model_name)
+
+    def render_status_cell(status: dict[str, Any]) -> str:
+        code = status.get("status")
+        detail = status.get("detail")
+        text = f"{code} ({detail})" if detail else code
+        if code is None:
+            return "⚠️ -"
+        if str(code).lower() in {"error"} or (isinstance(code, int) and code >= 400):
+            return f"❌ {text}"
+        if code in {"대기", "pending"}:
+            return f"⚠️ {text}"
+        return f"✅ {text}"
+
+    if models:
+        header = "| 회사/모델명 | " + " | ".join(models) + " |"
+        separator = "| --- | " + " | ".join(["---"] * len(models)) + " |"
+        status_row_cells = []
+        time_row_cells = []
+        for model_name in models:
+            status = api_status.get(model_name) or {}
+            status_row_cells.append(render_status_cell(status))
+            elapsed = durations.get(model_name)
+            if elapsed is None:
+                time_row_cells.append("-")
+            elif elapsed >= 1000:
+                time_row_cells.append(f"{elapsed/1000:.1f}s")
+            else:
+                time_row_cells.append(f"{elapsed}ms")
+        status_row = "| 응답상태 | " + " | ".join(status_row_cells) + " |"
+        time_row = "| 시간 | " + " | ".join(time_row_cells) + " |"
+        lines.extend([header, separator, status_row, time_row])
 
     errors = result.get("errors") or []
     if errors:
@@ -114,7 +149,54 @@ def format_summary_message(result: dict[str, Any]) -> str:
             message = error.get("message") or "메시지 없음"
             lines.append(f"- **{model}** (노드: {node}): {message}")
 
+    if answers:
+        lines.append("### 모델 응답")
+        for model_name, answer in answers.items():
+            lines.append(f"- **{model_name}**\n\n{answer or '응답 없음'}")
+
     return "\n\n".join(lines)
+
+
+def build_summary_table(result: dict[str, Any]) -> list[dict[str, str]]:
+    """요약 결과를 Streamlit 표로 표시하기 위한 행 리스트로 변환한다."""
+
+    answers = result.get("answers") or {}
+    api_status = result.get("api_status") or {}
+    durations = result.get("durations_ms") or {}
+    order = result.get("order") or []
+
+    models: list[str] = list(order)
+    for model_name in answers.keys():
+        if model_name not in models:
+            models.append(model_name)
+
+    def render_status_cell(status: dict[str, Any]) -> str:
+        code = status.get("status")
+        detail = status.get("detail")
+        text = f"{code} ({detail})" if detail else code
+        if code is None:
+            return "⚠️ -"
+        if str(code).lower() in {"error"} or (isinstance(code, int) and code >= 400):
+            return f"❌ {text}"
+        if code in {"대기", "pending"}:
+            return f"⚠️ {text}"
+        return f"✅ {text}"
+
+    status_row: dict[str, str] = {"항목": "응답상태"}
+    time_row: dict[str, str] = {"항목": "시간"}
+
+    for model in models:
+        status = api_status.get(model) or {}
+        status_row[model] = render_status_cell(status)
+        elapsed = durations.get(model)
+        if elapsed is None:
+            time_row[model] = "-"
+        elif elapsed >= 1000:
+            time_row[model] = f"{elapsed/1000:.1f}s"
+        else:
+            time_row[model] = f"{elapsed}ms"
+
+    return [status_row, time_row]
 
 
 chat_container = st.container()
@@ -137,69 +219,86 @@ if prompt is not None:
         st.warning("질문을 입력해주세요.")
     else:
         logger.info("챗 입력 수신")
-        st.session_state.chat_history.append({"role": "user", "content": question})
-        st.session_state.last_error = None
-        st.session_state.last_result = None
-        st.session_state.partial_data = {}
-        st.session_state.partial_order = []
-        partial_placeholder.info("LLM 응답을 대기 중입니다.")
-        try:
-            with httpx.stream(
-                "POST",
-                API_URL,
-                json={"question": question},
-                headers={"Content-Type": "application/json"},
-                timeout=180.0,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_text():
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    event_type = event.get("type", "partial")
-                    if event_type == "partial":
-                        model = event.get("model")
-                        if model and model not in st.session_state.partial_order:
-                            st.session_state.partial_order.append(model)
-                        if model:
-                            st.session_state.partial_data[model] = event
-                            logger.debug("부분 응답 갱신: %s", model)
-                        partial_placeholder.markdown(render_partial_results())
-                    elif event_type == "summary":
-                        st.session_state.last_result = event.get("result")
-                        logger.info("요약 이벤트 수신")
-                    elif event_type == "error":
-                        error_message = event.get("message", "알 수 없는 오류가 발생했습니다.")
-                        st.session_state.last_error = error_message
-                        logger.warning("오류 이벤트 수신: %s", error_message)
-                        continue
-        except httpx.HTTPStatusError as http_error:
-            response = http_error.response
+        previous_history = list(st.session_state.chat_history)
+        previous_user_turns = sum(1 for message in previous_history if message.get("role") == "user")
+        current_turn = previous_user_turns + 1
+
+        if current_turn > MAX_TURNS:
+            st.warning(f"최대 {MAX_TURNS}턴을 초과했습니다. 새 대화를 시작해주세요.")
+        else:
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            st.session_state.last_error = None
+            st.session_state.last_result = None
+            st.session_state.partial_data = {}
+            st.session_state.partial_order = []
+            partial_placeholder.info("LLM 응답을 대기 중입니다.")
             try:
-                detail = response.json().get("detail") if response else str(http_error)
-            except Exception:
-                detail = str(http_error)
-            status_text = response.status_code if response else "Unknown"
-            st.session_state.last_error = f"요청 실패 (HTTP {status_text}): {detail}"
-            logger.error("HTTP 오류: %s", st.session_state.last_error)
-        except httpx.ConnectError:
-            st.session_state.last_error = f"연결 오류: FastAPI 서버에 연결할 수 없습니다. URL을 확인하세요: {API_URL}"
-            logger.error("FastAPI 연결 실패: %s", API_URL)
-        except httpx.ReadTimeout:
-            st.session_state.last_error = "시간 초과: 요청이 3분을 초과했습니다. 서버 상태를 확인하세요."
-            logger.error("요청 시간 초과")
-        except httpx.RequestError as request_error:
-            st.session_state.last_error = f"알 수 없는 오류: {request_error}"
-            logger.error("기타 요청 오류: %s", request_error)
-        finally:
-            if not st.session_state.partial_data:
-                partial_placeholder.empty()
-            else:
-                partial_placeholder.markdown(render_partial_results())
+                with httpx.stream(
+                    "POST",
+                    API_URL,
+                    json={
+                        "question": question,
+                        "turn": current_turn,
+                        "max_turns": MAX_TURNS,
+                        "history": previous_history,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=180.0,
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_text():
+                        if not line:
+                            continue
+                        event = json.loads(line)
+                        event_type = event.get("type", "partial")
+                        if event_type == "partial":
+                            model = event.get("model")
+                            if model and model not in st.session_state.partial_order:
+                                st.session_state.partial_order.append(model)
+                            if model:
+                                st.session_state.partial_data[model] = event
+                                logger.debug("부분 응답 갱신: %s", model)
+                            partial_placeholder.markdown(render_partial_results())
+                        elif event_type == "summary":
+                            st.session_state.last_result = event.get("result")
+                            logger.info("요약 이벤트 수신")
+                        elif event_type == "error":
+                            error_message = event.get("message", "알 수 없는 오류가 발생했습니다.")
+                            st.session_state.last_error = error_message
+                            logger.warning("오류 이벤트 수신: %s", error_message)
+                            continue
+            except httpx.HTTPStatusError as http_error:
+                response = http_error.response
+                try:
+                    detail = response.json().get("detail") if response else str(http_error)
+                except Exception:
+                    detail = str(http_error)
+                status_text = response.status_code if response else "Unknown"
+                st.session_state.last_error = f"요청 실패 (HTTP {status_text}): {detail}"
+                logger.error("HTTP 오류: %s", st.session_state.last_error)
+            except httpx.ConnectError:
+                st.session_state.last_error = f"연결 오류: FastAPI 서버에 연결할 수 없습니다. URL을 확인하세요: {API_URL}"
+                logger.error("FastAPI 연결 실패: %s", API_URL)
+            except httpx.ReadTimeout:
+                st.session_state.last_error = "시간 초과: 요청이 3분을 초과했습니다. 서버 상태를 확인하세요."
+                logger.error("요청 시간 초과")
+            except httpx.RequestError as request_error:
+                st.session_state.last_error = f"알 수 없는 오류: {request_error}"
+                logger.error("기타 요청 오류: %s", request_error)
+            finally:
+                if not st.session_state.partial_data:
+                    partial_placeholder.empty()
+                else:
+                    partial_placeholder.markdown(render_partial_results())
 
 result = st.session_state.last_result
 if result:
     summary_markdown = format_summary_message(result)
+    with st.chat_message("assistant"):
+        table_rows = build_summary_table(result)
+        if table_rows:
+            st.table(table_rows)
+        st.markdown(summary_markdown)
     st.session_state.chat_history.append({"role": "assistant", "content": summary_markdown})
     st.session_state.last_result = None
     st.session_state.partial_data = {}
